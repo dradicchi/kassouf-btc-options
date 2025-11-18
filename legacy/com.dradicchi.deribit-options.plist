@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Job name -->
+    <key>Label</key>
+    <string>com.dradicchi.deribit-options</string>
+
+    <!-- Python script -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/dradicchi/Documents/Projects/python_work/deribit_btc_options/run_ordered_scripts.py</string>
+    </array>
+
+    <!-- Execution interval: each 10 minutes -->
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <!-- Run at system load (optional) -->
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

@@ -1,0 +1,281 @@
+###
+### Mounts trades to a prospective test with BTC day options.
+###
+
+## IMPORTANT: 
+## Is recommended to update all the historic databases, at least once time a 
+## day (running "run_build_scripts.py"), before to execute this script.
+
+import datetime
+import time
+import requests
+import json
+from pymongo import MongoClient, DESCENDING, ASCENDING
+import math
+import numpy as np
+from mpmath import mp
+from scipy.stats import linregress
+
+start_time = time.time()
+
+# API definitions.
+prod_base_url = "https://deribit.com/api/v2/public/"
+order_book_endpoint = f"get_order_book"
+index_price_endpoint = f"get_index_price"
+
+# DB access.
+client = MongoClient('mongodb://localhost:27017/')
+db = client['deribit_btc_options']
+index_price_collection = db['btc_index_price_hourly']
+index_price_d_avg_collection = db['btc_avg_index_price_daily']
+instrument_collection = db['btc_day_inverse_options_offering']
+z_model_collection = db['btc_day_z_models']
+adj_model_collection = db['btc_day_adj_models']
+prospec_test_collection = db['btc_day_prospective_test']
+
+td = datetime.datetime.now()
+
+
+##
+## Calculating BTC trend (E1) and volatility (E2) indexes
+##
+
+# Gets the last 90 values of the index price 90-day moving average, including 
+# today's partial values.
+
+# First, gets the today's partial index price average.
+# pipeline = [
+#     {'$match': 
+#         {'datetime': {'$gte': td, 
+#                       '$lt': (td + datetime.timedelta(days=1))}}},
+#     {'$group': {
+#         '_id': None,
+#         'sum_price': {'$sum': '$index_price'},
+#         'count': {'$sum': 1}
+#     }}
+# ]
+# result = list(index_price_collection.aggregate(pipeline))
+# td_sum_price = float(result[0]['sum_price'])
+# td_count = int(result[0]['count'])
+# td_partial_average = sum_price / count
+
+# Gets the current index price:
+index_price_params = {
+                      'index_name': "btc_usd",                 
+                     }
+
+response = requests.get(f"{prod_base_url}{index_price_endpoint}", 
+                        params=index_price_params)
+
+if response.status_code == 200:
+    data = response.json()
+    cur_index_price = float(data['result']['index_price'])
+
+# Gets the 179 most recent documents and retrieves only the price average field.
+avg_prices_list = index_price_d_avg_collection.find({}, 
+                                        {'_id': 0, 'avg_index_price_daily': 1}
+                                        ).sort('datetime', -1).limit(179)
+prices_list = [doc['avg_index_price_daily'] for doc in avg_prices_list]
+prices_ascending = prices_list[::-1]
+
+# A list with the 180 most recent index price daily average.
+prices_ascending.append(cur_index_price)
+
+# The 90 most recent values (in ascending order) to the index price 90-day 
+# moving average.
+mov_avg_90d_list = np.convolve(prices_ascending, np.ones(90)/90, mode='valid')
+mov_avg_90d = mov_avg_90d_list[-90:]
+
+# Computes the natural logarithms of average daily prices.
+log_prices = np.log(mov_avg_90d)
+days = np.arange(1, 91)
+
+# Computes the linear regression to find the slope (E1 - Trendline Slope).
+slope, intercept, r_value, p_value, std_err = linregress(days, log_prices)
+e1 = slope
+
+# Computes the standard deviation of the logarithms of the daily average prices 
+# (E2 - Standard Deviation of Price Logarithms - Sazonality). 
+e2 = np.std(log_prices)
+
+
+##
+## Starting the prospective test
+##
+
+# Gets the active BTC day options offer:
+active_instruments = instrument_collection.find(
+                    {'is_active': True, 'option_type': "call"}).sort("expiration_datetime", ASCENDING)
+
+for instrument in active_instruments:
+
+    ##
+    ## Calculating the instrument fair price
+    ##
+
+    # Gets t (time left).
+    td_unix = int(time.mktime(td.timetuple()) * 1000)
+    t = instrument['expiration_unix_timestamp'] - td_unix
+
+    # Gets life-time status (in milliseconds):
+    life_time_portion = ((td_unix - instrument['creation_unix_timestamp']) / 
+                         (instrument['expiration_unix_timestamp'] - 
+                          instrument['creation_unix_timestamp']))
+
+    # Gets logXdivXavg:
+    logXdivXavg = math.log(cur_index_price / (sum(mov_avg_90d) / 90))
+
+    # Gets x:
+    x = cur_index_price / instrument['strike']
+
+
+    # Iterates all z models:
+    z_model_list = z_model_collection.find({'instrument_cycle': "day", 'model_name': "001-day-all-e1-e2"})
+
+    for z_model in z_model_list:
+
+        # Gets z:
+        z = mp.mpf(z_model['k1'] + 
+                   (z_model['k2'] * (1 / t)) + 
+                   (z_model['k3'] * e1) + 
+                   (z_model['k4'] * e2) + 
+                   (z_model['k5'] * x) + 
+                   (z_model['k6'] * instrument['strike']))
+
+        # Gets y = ((1 + (x**z))**(1/z)) - 1):
+        try:
+            term = mp.power(x, z)  # x**z
+            term = mp.power(1 + term, 1 / z)  # (1 + (x**z))**(1 / z)
+            y = term - 1
+        except: 
+            y = None
+
+        # The calculed fair price to the instrument.
+        if y:
+            Y = y * instrument['strike']
+
+            # Note: In the Deribit's options offering, the lowest possible 
+            # tradable value for Y is "0.0001".
+            if Y <= 0.0001:
+                Y = 0.0001
+        else:
+            Y = None
+
+
+        ##
+        ## Exploring order book
+        ##
+
+        # Gets the current order book:
+        order_book_params = {
+                             'instrument_name': instrument['instrument_name'],
+                             'depth': 1 # [1, 5, 10, 20, 50, 100, 1000, 10000]                      
+                            }
+
+        response = requests.get(f"{prod_base_url}{order_book_endpoint}", 
+                                params=order_book_params)
+
+        if response.status_code == 200:
+            current_order_book = response.json()
+
+        # Gets the current open bids:
+        bids = current_order_book['result']['bids']
+
+        if bids:
+            for bid in bids:
+
+                if Y:
+                    # Gets the ratio between the observed price (for the instruemnt) and
+                    # the calculed fair price.
+                    YdivY = float(bid[0]) / Y
+                else:
+                    YdivY = None
+
+                if YdivY:
+
+                        # Iterates all z models:
+                        adj_model_list = adj_model_collection.find({'model_name': "002"})
+
+                        for adj_model in adj_model_list:
+
+                            if ((float(adj_model['YdivY'][0]) <= YdivY <= float(adj_model['YdivY'][1])) and
+                                (float(adj_model['life_time_portion'][0]) <= life_time_portion <= float(adj_model['life_time_portion'][1])) and
+                                (float(adj_model['logXdivXavg'][0]) <= logXdivXavg <= float(adj_model['logXdivXavg'][1])) and
+                                (float(adj_model['iv'][0]) <= current_order_book['result']['mark_iv'] <= float(adj_model['iv'][1])) and
+                                (float(adj_model['x'][0]) <= x <= float(adj_model['x'][1])) and
+                                (float(adj_model['e1'][0]) <= e1 <= float(adj_model['e1'][1])) and
+                                (float(adj_model['e2'][0]) <= e2 <= float(adj_model['e2'][1]))):
+
+                                # Inits the prospective test database.
+                                last_document = prospec_test_collection.find_one(sort=[('datetime', -1)])
+                                if last_document is None:
+                                    prospec_test_collection.create_index([('datetime', DESCENDING)])
+                                    prospec_test_collection.create_index([('datetime', ASCENDING)])
+
+
+                                filter = { 'instrument': instrument['instrument_name'] }
+                                sort = [('vars.YdivY', -1)]
+
+                                trade_is_considered = prospec_test_collection.find_one(filter, sort=sort)
+
+                                if (trade_is_considered is None) or (YdivY > (float(trade_is_considered['vars']['YdivY']) * 1.25)):
+
+                                    new_trade = {
+                                                 'datetime': td,
+                                                 'unix_datetime': td_unix,
+                                                 'instrument' : instrument['instrument_name'],
+                                                 'z_model' : z_model['model_name'],
+                                                 'adj_model' : adj_model['model_name'],
+                                                 'vars' : {
+                                                           't' : (1 / t),
+                                                           'e1' : e1,
+                                                           'e2' : e2,
+                                                           'x' : x,
+                                                           'strike' : instrument['strike'],
+                                                           'life_time_portion' : life_time_portion,
+                                                           'logXdivXavg' : logXdivXavg,
+                                                           'iv' : current_order_book['result']['mark_iv'],
+                                                           'YdivY' : str(YdivY),
+                                                           'z' : str(z),
+                                                          },
+                                                'index_price': cur_index_price,
+                                                'instrument_fair_price' : str(Y),
+                                                'instrument_mark_price' : current_order_book['result']['mark_price'],
+                                                'bid' : bid[0],
+                                                'amount' : bid[1],
+                                                }
+
+                                    # Insert the document into the collection
+                                    #prospec_test_collection.insert_one(new_trade)
+
+                                    # Shows the job execution on terminal.
+                                    print(td, 
+                                          instrument['instrument_name'], 
+                                          z_model['model_name'], 
+                                          adj_model['model_name'], 
+                                          YdivY,
+                                          x, 
+                                          bid[0])
+
+
+# Logs the execution time.
+end_time = time.time()
+execution_time = end_time - start_time
+print(f"A new order book analysis cycle has been completed! - Exec Time: {execution_time}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
